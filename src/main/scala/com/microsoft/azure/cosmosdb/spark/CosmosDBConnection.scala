@@ -135,6 +135,7 @@ private[spark] case class CosmosDBConnection(config: Config) extends CosmosDBLog
     .getOrElse(CosmosDBConfig.DefaultConnectionMode))
   private var collection: DocumentCollection = _
   private var database: Database = _
+  private var collectionThroughput: Option[Int] = None
 
   @transient private var bulkImporter: DocumentBulkExecutor = _
 
@@ -213,21 +214,28 @@ private[spark] case class CosmosDBConnection(config: Config) extends CosmosDBLog
   }
 
   def getCollectionThroughput: Int = {
-    var offers = documentClient.queryOffers(s"SELECT * FROM c where c.offerResourceId = '${getCollection.getResourceId}'", null).getQueryIterable.toList
-    if (offers.isEmpty) {
-      offers = documentClient.queryOffers(s"SELECT * FROM c where c.offerResourceId = '${getDatabase.getResourceId}'", null).getQueryIterable.toList
-      // database throughput
-      if (offers.isEmpty) {
-          throw new IllegalStateException("Cannot find the collection corresponding offer.")
+    collectionThroughput match {
+      case Some(value) => value
+      case None => {
+        var offers = documentClient.queryOffers(s"SELECT * FROM c where c.offerResourceId = '${getCollection.getResourceId}'", null).getQueryIterable.toList
+        if (offers.isEmpty) {
+          offers = documentClient.queryOffers(s"SELECT * FROM c where c.offerResourceId = '${getDatabase.getResourceId}'", null).getQueryIterable.toList
+          // database throughput
+          if (offers.isEmpty) {
+            throw new IllegalStateException("Cannot find the collection corresponding offer.")
+          }
+        }
+
+        val offer = offers.get(0)
+        val collectionThroughput = if (offer.getString("offerVersion") == "V1")
+          CosmosDBConfig.SinglePartitionCollectionOfferThroughput
+        else
+          offer.getContent.getInt("offerThroughput")
+
+        this.collectionThroughput = Some(collectionThroughput)
+        collectionThroughput
       }
     }
-
-    val offer = offers.get(0)
-    val collectionThroughput = if (offer.getString("offerVersion") == "V1")
-      CosmosDBConfig.SinglePartitionCollectionOfferThroughput
-    else
-      offer.getContent.getInt("offerThroughput")
-    collectionThroughput
   }
 
   def reinitializeClient () = {
