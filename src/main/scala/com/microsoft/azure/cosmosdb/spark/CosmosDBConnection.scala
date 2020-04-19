@@ -213,30 +213,7 @@ private[spark] case class CosmosDBConnection(config: Config) extends CosmosDBLog
     getAllPartitions
   }
 
-  def getCollectionThroughput: Int = {
-    collectionThroughput match {
-      case Some(value) => value
-      case None => {
-        var offers = documentClient.queryOffers(s"SELECT * FROM c where c.offerResourceId = '${getCollection.getResourceId}'", null).getQueryIterable.toList
-        if (offers.isEmpty) {
-          offers = documentClient.queryOffers(s"SELECT * FROM c where c.offerResourceId = '${getDatabase.getResourceId}'", null).getQueryIterable.toList
-          // database throughput
-          if (offers.isEmpty) {
-            throw new IllegalStateException("Cannot find the collection corresponding offer.")
-          }
-        }
-
-        val offer = offers.get(0)
-        val collectionThroughput = if (offer.getString("offerVersion") == "V1")
-          CosmosDBConfig.SinglePartitionCollectionOfferThroughput
-        else
-          offer.getContent.getInt("offerThroughput")
-
-        this.collectionThroughput = Some(collectionThroughput)
-        collectionThroughput
-      }
-    }  
-  }
+  def getCollectionThroughput: Int = 360000
 
   def reinitializeClient () = {
     documentClient = CosmosDBConnection.reinitializeClient(getCollection, connectionMode, getClientConfiguration(config))
