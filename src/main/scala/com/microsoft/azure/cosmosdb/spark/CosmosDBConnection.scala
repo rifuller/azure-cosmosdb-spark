@@ -52,7 +52,6 @@ case class BulkExecutorSettings(partitionKeyOption: Option[PartitionKeyDefinitio
 object ClientConfiguration extends CosmosDBLoggingTrait {
   def apply(config: Config): ClientConfiguration = {
     // TODO: validate that either master key or resource token is set but not both
-    // TODO: BUlk configuration
     val connectionPolicy = new ConnectionPolicy()
 
     val connectionMode = ConnectionMode.valueOf(config.getOrElse(CosmosDBConfig.ConnectionMode, CosmosDBConfig.DefaultConnectionMode))
@@ -168,7 +167,7 @@ object CosmosDBConnectionCache {
         config.database,
         config.collection,
         pkDef,
-        1)
+        1 )  // TODO: get the throughput from config or from the DB
         .withMaxUpdateMiniBatchCount(config.bulkConfig.maxMiniBatchUpdateCount)
         .withMaxMiniBatchSize(config.bulkConfig.maxMiniBatchImportSizeKB * 1024)
 
@@ -268,9 +267,7 @@ private[spark] case class CosmosDBConnection(config: Config) extends CosmosDBLog
 
   private var collection: DocumentCollection = _
   private var database: Database = _
-  private var collectionThroughput: Option[Int] = None
-
-  @transient private var bulkImporter: DocumentBulkExecutor = _
+  //private var collectionThroughput: Option[Int] = None
 
   private var documentClient: DocumentClient = CosmosDBConnection.getClient(connectionMode, getClientConfiguration(config))
 
