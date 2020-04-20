@@ -25,70 +25,221 @@ package com.microsoft.azure.cosmosdb.spark
 import java.lang.management.ManagementFactory
 
 import com.microsoft.azure.cosmosdb.spark.config._
-import com.microsoft.azure.documentdb
 import com.microsoft.azure.documentdb._
 import com.microsoft.azure.documentdb.bulkexecutor.DocumentBulkExecutor
 import com.microsoft.azure.documentdb.internal._
-import com.microsoft.azure.documentdb.Permission
 import com.microsoft.azure.documentdb.internal.routing.PartitionKeyRangeCache
 
 import scala.collection.JavaConversions._
+import scala.collection.mutable
 import scala.collection.mutable.ListBuffer
 import scala.language.implicitConversions
 import scala.util.control.Breaks._
 
-
 case class ClientConfiguration(host: String,
+                               database: String,
+                               collection: String,
                                key: String,
                                connectionPolicy: ConnectionPolicy,
                                consistencyLevel: ConsistencyLevel,
-                               resourceLink: String)
+                               resourceLink: Option[String],
+                               bulkConfig: BulkExecutorSettings)
+
+case class BulkExecutorSettings(partitionKeyOption: Option[PartitionKeyDefinition],
+                                maxMiniBatchUpdateCount: Int,
+                                maxMiniBatchImportSizeKB: Int)
+
+object ClientConfiguration extends CosmosDBLoggingTrait {
+  def apply(config: Config): ClientConfiguration = {
+    // TODO: validate that either master key or resource token is set but not both
+    // TODO: BUlk configuration
+    val connectionPolicy = new ConnectionPolicy()
+
+    val connectionMode = ConnectionMode.valueOf(config.getOrElse(CosmosDBConfig.ConnectionMode, CosmosDBConfig.DefaultConnectionMode))
+    connectionPolicy.setConnectionMode(connectionMode)
+
+    val applicationName: Option[String] = config.get[String](CosmosDBConfig.ApplicationName)
+    val userAgentString: String = Constants.userAgentSuffix + " " + ManagementFactory.getRuntimeMXBean.getName ++ if (applicationName.isDefined) {
+      " " ++ applicationName.get
+    }
+    connectionPolicy.setUserAgentSuffix(userAgentString)
+
+    config.get[String](CosmosDBConfig.ConnectionRequestTimeout) match {
+      case Some(connectionRequestTimeoutStr) => connectionPolicy.setRequestTimeout(connectionRequestTimeoutStr.toInt)
+      case None => // skip
+    }
+
+    config.get[String](CosmosDBConfig.ConnectionIdleTimeout) match {
+      case Some(connectionIdleTimeoutStr) => connectionPolicy.setIdleConnectionTimeout(connectionIdleTimeoutStr.toInt)
+      case None => // skip
+    }
+
+    val maxConnectionPoolSize = config.getOrElse[String](CosmosDBConfig.ConnectionMaxPoolSize, CosmosDBConfig.DefaultMaxConnectionPoolSize.toString)
+    connectionPolicy.setMaxPoolSize(maxConnectionPoolSize.toInt)
+
+    val maxRetryAttemptsOnThrottled = config.getOrElse[String](CosmosDBConfig.QueryMaxRetryOnThrottled, CosmosDBConfig.DefaultQueryMaxRetryOnThrottled.toString)
+    connectionPolicy.getRetryOptions.setMaxRetryAttemptsOnThrottledRequests(maxRetryAttemptsOnThrottled.toInt)
+
+    val maxRetryWaitTimeSecs = config.getOrElse[String](CosmosDBConfig.QueryMaxRetryWaitTimeSecs, CosmosDBConfig.DefaultQueryMaxRetryWaitTimeSecs.toString)
+    connectionPolicy.getRetryOptions.setMaxRetryWaitTimeInSeconds(maxRetryWaitTimeSecs.toInt)
+
+    val preferredRegionsList = config.get[String](CosmosDBConfig.PreferredRegionsList)
+    if (preferredRegionsList.isDefined) {
+      logTrace(s"CosmosDBConnection::Input preferred region list: ${preferredRegionsList.get}")
+      val preferredLocations = preferredRegionsList.get.split(";").map(_.trim).toList
+      connectionPolicy.setPreferredLocations(preferredLocations)
+    }
+
+    // Get consistency level
+    val consistencyLevel = ConsistencyLevel.valueOf(config.getOrElse(CosmosDBConfig.ConsistencyLevel, CosmosDBConfig.DefaultConsistencyLevel))
+
+    val database = config.get(CosmosDBConfig.Database).get
+    val collection = config.get(CosmosDBConfig.Collection).get
+
+    // Check if resource token exists
+    val resourceToken = config.get[String](CosmosDBConfig.ResourceToken)
+    val resourceLink: Option[String] = if(resourceToken.isDefined) {
+      Some(getCollectionLink(database, collection))
+    } else {
+      None
+    }
+
+    val pkDef: Option[PartitionKeyDefinition] = config.get[String](CosmosDBConfig.PartitionKeyDefinition).map(pk => {
+      val pkDefinition = new PartitionKeyDefinition()
+      val paths: ListBuffer[String] = new ListBuffer[String]()
+      paths.add(pk)
+      pkDefinition.setPaths(paths)
+      pkDefinition
+    })
+
+    val maxMiniBatchImportSizeKB: Int = config
+      .getOrElse(CosmosDBConfig.MaxMiniBatchImportSizeKB, CosmosDBConfig.DefaultMaxMiniBatchImportSizeKB)
+    val maxMiniBatchUpdateCount: Int = config
+      .getOrElse(CosmosDBConfig.MaxMiniBatchUpdateCount, CosmosDBConfig.DefaultMaxMiniBatchUpdateCount)
+
+    val bulkExecutorSettings = BulkExecutorSettings(
+      pkDef,
+      maxMiniBatchUpdateCount,
+      maxMiniBatchImportSizeKB)
+
+    ClientConfiguration(
+      config.get(CosmosDBConfig.Endpoint).get,
+      config.get(CosmosDBConfig.Database).get,
+      config.get(CosmosDBConfig.Collection).get,
+      config.getOrElse(CosmosDBConfig.Masterkey, resourceToken.get),
+      connectionPolicy,
+      consistencyLevel,
+      resourceLink,
+      bulkExecutorSettings)
+  }
+
+  def getCollectionLink(database: String, collection: String): String = {
+    s"${Paths.DATABASES_PATH_SEGMENT}/$database/${Paths.COLLECTIONS_PATH_SEGMENT}/$collection"
+  }
+}
+
+case class ClientCacheEntry(docClient: DocumentClient,
+                            bulkExecutor: Option[DocumentBulkExecutor])
+
+object CosmosDBConnectionCache {
+  lazy val clientCache: mutable.Map[ClientConfiguration, ClientCacheEntry] = mutable.Map[ClientConfiguration,ClientCacheEntry]()
+
+  def invalidate(key: ClientConfiguration): Unit = {
+    clientCache.remove(key)
+  }
+
+  def getOrCreateBulkExecutor(config: ClientConfiguration): DocumentBulkExecutor = {
+    if (!clientCache.contains(config) || clientCache(config).bulkExecutor.isEmpty) {
+      val client: DocumentClient = getOrCreateClient(config)
+
+      // Initialize bulk executor per guidance in:
+      // https://docs.microsoft.com/en-us/azure/cosmos-db/bulk-executor-java#bulk-import-data-to-azure-cosmos-db
+      // Set client's retry options high for initialization
+      client.getConnectionPolicy.getRetryOptions.setMaxRetryWaitTimeInSeconds(30) // was:1000
+      client.getConnectionPolicy.getRetryOptions.setMaxRetryAttemptsOnThrottledRequests(9) // was: 1000
+
+      val pkDef = config.bulkConfig.partitionKeyOption.getOrElse({
+        val collectionLink = ClientConfiguration.getCollectionLink(config.database, config.collection)
+        client.readCollection(collectionLink, null).getResource.getPartitionKey
+      })
+
+      val builder = DocumentBulkExecutor.builder.from(
+        client,
+        config.database,
+        config.collection,
+        pkDef,
+        1)
+        .withMaxUpdateMiniBatchCount(config.bulkConfig.maxMiniBatchUpdateCount)
+        .withMaxMiniBatchSize(config.bulkConfig.maxMiniBatchImportSizeKB * 1024)
+
+      // Instantiate DocumentBulkExecutor
+      val bulkExecutor = builder.build()
+
+      // Set retries to 0 to pass complete control to bulk executor
+      client.getConnectionPolicy.getRetryOptions.setMaxRetryWaitTimeInSeconds(0)
+      client.getConnectionPolicy.getRetryOptions.setMaxRetryAttemptsOnThrottledRequests(0)
+
+      clientCache(config) = ClientCacheEntry(client, Some(bulkExecutor))
+    }
+
+    clientCache(config).bulkExecutor.get
+  }
+
+  def getOrCreateClient(config: ClientConfiguration): DocumentClient = {
+    if (!clientCache.contains(config)) {
+      val client = if(config.resourceLink.isDefined) {
+        createClientWithResourceToken(config)
+      } else {
+        createClientWithMasterKey(config)
+      }
+
+      clientCache(config) = ClientCacheEntry(client, null)
+    }
+
+    clientCache(config).docClient
+  }
+
+  private def createClientWithMasterKey(config: ClientConfiguration): DocumentClient =
+    new DocumentClient(
+      config.host,
+      config.key,
+      config.connectionPolicy,
+      config.consistencyLevel)
+
+  private def createClientWithResourceToken(config: ClientConfiguration): DocumentClient = {
+    val permissionWithNamedResourceLink = new Permission()
+    permissionWithNamedResourceLink.set("_token", config.key)
+    permissionWithNamedResourceLink.setResourceLink(config.resourceLink.get)
+
+    val namedResourceLinkPermission = List[Permission](permissionWithNamedResourceLink)
+
+    val client = new DocumentClient(
+      config.host,
+      namedResourceLinkPermission,
+      config.connectionPolicy,
+      config.consistencyLevel)
+
+    // Grab the other permission thing
+    val collection = client.readCollection(config.resourceLink.get, null);
+    client.close()
+
+    val collectionSelfLink = collection.getResource.getSelfLink;
+
+    val permissionWithSelfLink = new Permission()
+    permissionWithSelfLink.set("_token", config.key)
+    permissionWithSelfLink.setResourceLink(collectionSelfLink)
+
+    val permissions = List[Permission](permissionWithSelfLink, permissionWithNamedResourceLink)
+
+    new DocumentClient(
+      config.host,
+      permissions,
+      config.connectionPolicy,
+      config.consistencyLevel)
+  }
+}
 
 object CosmosDBConnection extends CosmosDBLoggingTrait {
-  // For verification purpose
-  var lastConnectionPolicy: ConnectionPolicy = _
-  var lastConsistencyLevel: Option[ConsistencyLevel] = _
-  var clients: scala.collection.mutable.Map[String, DocumentClient] = scala.collection.mutable.Map[String,DocumentClient]()
-
-  def getClient(connectionMode: ConnectionMode, clientConfiguration: ClientConfiguration): DocumentClient = synchronized {
-    if(clientConfiguration.key.isEmpty) {
-      throw new IllegalArgumentException("Master key/Resource token are missing")
-    }
-    val cacheKey = clientConfiguration.host + "-" + clientConfiguration.key
-    if (!clients.contains(cacheKey)) {
-      logInfo(s"Initializing new client for host ${clientConfiguration.host}")
-      if(clientConfiguration.resourceLink.isEmpty) {
-          clients(cacheKey) = new DocumentClient(
-          clientConfiguration.host,
-          clientConfiguration.key,
-          clientConfiguration.connectionPolicy,
-          clientConfiguration.consistencyLevel)
-      }
-      else {
-        val collectionSelfLink = getCollectionSelfLink(clientConfiguration)
-        val permissionWithSelfLink = new Permission()
-        permissionWithSelfLink.set("_token", clientConfiguration.key)
-        permissionWithSelfLink.setResourceLink(collectionSelfLink)
-
-        val permissionWithNamedResourceLink = new Permission()
-        permissionWithNamedResourceLink.set("_token", clientConfiguration.key)
-        permissionWithNamedResourceLink.setResourceLink(clientConfiguration.resourceLink)
-
-        val permissions = List(permissionWithSelfLink, permissionWithNamedResourceLink)
-
-        clients(cacheKey) = new DocumentClient(
-          clientConfiguration.host,
-          permissions,
-          clientConfiguration.connectionPolicy,
-          clientConfiguration.consistencyLevel
-        )
-      }
-      CosmosDBConnection.lastConsistencyLevel = Some(clientConfiguration.consistencyLevel)
-    }
-
-    clients.get(cacheKey).get
-   }
-
    def reinitializeClient(collection: DocumentCollection, connectionMode: ConnectionMode, clientConfiguration: ClientConfiguration): DocumentClient = synchronized {
      logInfo("re-initializing client")
      val cacheKey = clientConfiguration.host + "-" + clientConfiguration.key
@@ -104,23 +255,6 @@ object CosmosDBConnection extends CosmosDBLoggingTrait {
 
      getClient(connectionMode, clientConfiguration)
    }
-
-  private def getCollectionSelfLink(clientConfiguration: ClientConfiguration): String = {
-      val permission = new Permission()
-      permission.set("_token", clientConfiguration.key)
-      permission.setResourceLink(clientConfiguration.resourceLink)
-      val permissions = List(permission)
-      val client = new DocumentClient(
-        clientConfiguration.host,
-        permissions,
-        clientConfiguration.connectionPolicy,
-        clientConfiguration.consistencyLevel
-      )
-      val collection = client.readCollection(clientConfiguration.resourceLink, null);
-      val collectionSelfLink = collection.getResource().getSelfLink();
-      client.close()
-      return collectionSelfLink
-  }
  }
 
 private[spark] case class CosmosDBConnection(config: Config) extends CosmosDBLoggingTrait with Serializable {
@@ -130,9 +264,8 @@ private[spark] case class CosmosDBConnection(config: Config) extends CosmosDBLog
     config.getOrElse[String](CosmosDBConfig.ChangeFeedMaxPagesPerBatch, CosmosDBConfig.DefaultChangeFeedMaxPagesPerBatch.toString).toInt
   private val databaseLink = s"${Paths.DATABASES_PATH_SEGMENT}/$databaseName"
   private val collectionName = config.get[String](CosmosDBConfig.Collection).get
-  val collectionLink = s"${Paths.DATABASES_PATH_SEGMENT}/$databaseName/${Paths.COLLECTIONS_PATH_SEGMENT}/$collectionName"
-  private val connectionMode = ConnectionMode.valueOf(config.get[String](CosmosDBConfig.ConnectionMode)
-    .getOrElse(CosmosDBConfig.DefaultConnectionMode))
+  //val collectionLink = s"${Paths.DATABASES_PATH_SEGMENT}/$databaseName/${Paths.COLLECTIONS_PATH_SEGMENT}/$collectionName"
+
   private var collection: DocumentCollection = _
   private var database: Database = _
   private var collectionThroughput: Option[Int] = None
@@ -140,55 +273,6 @@ private[spark] case class CosmosDBConnection(config: Config) extends CosmosDBLog
   @transient private var bulkImporter: DocumentBulkExecutor = _
 
   private var documentClient: DocumentClient = CosmosDBConnection.getClient(connectionMode, getClientConfiguration(config))
-
-  def getPartitionKeyDefinition(partitionKeyDefinition: Option[String]) : PartitionKeyDefinition = {
-    if (partitionKeyDefinition.isDefined) {
-        val pkDefinition = new PartitionKeyDefinition()
-        val paths: ListBuffer[String] = new ListBuffer[String]()
-        paths.add(partitionKeyDefinition.get)
-        pkDefinition.setPaths(paths)  
-
-        pkDefinition
-    }
-    else {
-      getCollection.getPartitionKey
-    }
-  }
-
-  def getDocumentBulkImporter(collectionThroughput: Int, partitionKeyDefinition: Option[String], maxMiniBatchUpdateCount: Int, maxMiniBatchImportSizeKB: Int): DocumentBulkExecutor = {
-    if (bulkImporter == null) {
-      val initializationRetryOptions = new RetryOptions()
-      initializationRetryOptions.setMaxRetryAttemptsOnThrottledRequests(1000)
-      initializationRetryOptions.setMaxRetryWaitTimeInSeconds(1000)
-
-      val pkDefinition = getPartitionKeyDefinition(partitionKeyDefinition)
-
-      bulkImporter = DocumentBulkExecutor.builder.from(documentClient,
-        databaseName,
-        collectionName,
-        pkDefinition,
-        collectionThroughput
-      ).withInitializationRetryOptions(initializationRetryOptions)
-        .withMaxUpdateMiniBatchCount(maxMiniBatchUpdateCount)
-        .withMaxMiniBatchSize(maxMiniBatchImportSizeKB * 1024).build()
-    }
-
-    bulkImporter
-  }
-
-  def setDefaultClientRetryPolicy: Unit = {
-    if (documentClient != null) {
-      documentClient.getConnectionPolicy().getRetryOptions().setMaxRetryAttemptsOnThrottledRequests(1000);
-      documentClient.getConnectionPolicy().getRetryOptions().setMaxRetryWaitTimeInSeconds(1000);
-    }
-  }
-
-  def setZeroClientRetryPolicy: Unit = {
-    if (documentClient != null) {
-      documentClient.getConnectionPolicy().getRetryOptions().setMaxRetryAttemptsOnThrottledRequests(0);
-      documentClient.getConnectionPolicy().getRetryOptions().setMaxRetryWaitTimeInSeconds(0);
-    }
-  }
 
   def getCollection: DocumentCollection = {
     if (collection == null) {
@@ -215,10 +299,7 @@ private[spark] case class CosmosDBConnection(config: Config) extends CosmosDBLog
 
   def getCollectionThroughput: Int = 360000
 
-  def reinitializeClient () = {
-    documentClient = CosmosDBConnection.reinitializeClient(getCollection, connectionMode, getClientConfiguration(config))
-    collectionThroughput = None
-  }
+  def reinitializeClient () = Unit
 
   def queryDocuments (queryString : String,
         feedOpts : FeedOptions) : Iterator [Document] = {
@@ -421,66 +502,6 @@ private[spark] case class CosmosDBConnection(config: Config) extends CosmosDBLog
       collection = response.getResource
     }
     response.getDocumentCountUsage == 0
-  }
-
-  private def getClientConfiguration(config: Config): ClientConfiguration = {
-    // Generate connection policy
-    val connectionPolicy = new ConnectionPolicy()
-
-    connectionPolicy.setConnectionMode(connectionMode)
-
-    val applicationName = config.get[String](CosmosDBConfig.ApplicationName)
-    if (applicationName.isDefined) {
-      // Merging the Spark connector version with Spark executor process id and application name for user agent
-      connectionPolicy.setUserAgentSuffix(Constants.userAgentSuffix + " " + ManagementFactory.getRuntimeMXBean().getName() + " " + applicationName.get)
-    } else {
-      // Merging the Spark connector version with Spark executor process id for user agent
-      connectionPolicy.setUserAgentSuffix(Constants.userAgentSuffix + " " + ManagementFactory.getRuntimeMXBean().getName())
-    }
-
-    config.get[String](CosmosDBConfig.ConnectionRequestTimeout) match {
-      case Some(connectionRequestTimeoutStr) => connectionPolicy.setRequestTimeout(connectionRequestTimeoutStr.toInt)
-      case None => // skip
-    }
-
-    config.get[String](CosmosDBConfig.ConnectionIdleTimeout) match {
-      case Some(connectionIdleTimeoutStr) => connectionPolicy.setIdleConnectionTimeout(connectionIdleTimeoutStr.toInt)
-      case None => // skip
-    }
-
-    val maxConnectionPoolSize = config.getOrElse[String](CosmosDBConfig.ConnectionMaxPoolSize, CosmosDBConfig.DefaultMaxConnectionPoolSize.toString)
-    connectionPolicy.setMaxPoolSize(maxConnectionPoolSize.toInt)
-
-    val maxRetryAttemptsOnThrottled = config.getOrElse[String](CosmosDBConfig.QueryMaxRetryOnThrottled, CosmosDBConfig.DefaultQueryMaxRetryOnThrottled.toString)
-    connectionPolicy.getRetryOptions.setMaxRetryAttemptsOnThrottledRequests(maxRetryAttemptsOnThrottled.toInt)
-
-    val maxRetryWaitTimeSecs = config.getOrElse[String](CosmosDBConfig.QueryMaxRetryWaitTimeSecs, CosmosDBConfig.DefaultQueryMaxRetryWaitTimeSecs.toString)
-    connectionPolicy.getRetryOptions.setMaxRetryWaitTimeInSeconds(maxRetryWaitTimeSecs.toInt)
-
-    val preferredRegionsList = config.get[String](CosmosDBConfig.PreferredRegionsList)
-    if (preferredRegionsList.isDefined) {
-      logTrace(s"CosmosDBConnection::Input preferred region list: ${preferredRegionsList.get}")
-      val preferredLocations = preferredRegionsList.get.split(";").toSeq.map(_.trim)
-      connectionPolicy.setPreferredLocations(preferredLocations)
-    }
-
-    // Get consistency level
-    val consistencyLevel = ConsistencyLevel.valueOf(config.get[String](CosmosDBConfig.ConsistencyLevel)
-      .getOrElse(CosmosDBConfig.DefaultConsistencyLevel))
-
-    //Check if resource token exists
-    val resourceToken = config.getOrElse[String](CosmosDBConfig.ResourceToken, "")
-    var resourceLink: String = ""
-    if(!resourceToken.isEmpty) {
-      resourceLink = s"dbs/${config.get[String](CosmosDBConfig.Database).get}/colls/${config.get[String](CosmosDBConfig.Collection).get}"
-    }
-
-    ClientConfiguration(
-      config.get[String](CosmosDBConfig.Endpoint).get,
-      config.getOrElse[String](CosmosDBConfig.Masterkey, resourceToken),
-      connectionPolicy,
-      consistencyLevel,
-      resourceLink)
   }
 }
 

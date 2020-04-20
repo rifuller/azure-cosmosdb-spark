@@ -392,9 +392,6 @@ object CosmosDBSpark extends CosmosDBLoggingTrait {
     val maxMiniBatchUpdateCount = config
       .getOrElse(CosmosDBConfig.MaxMiniBatchUpdateCount, String.valueOf(CosmosDBConfig.DefaultMaxMiniBatchUpdateCount))
       .toInt
-    val maxMiniBatchImportSizeKB = config
-      .getOrElse(CosmosDBConfig.MaxMiniBatchImportSizeKB, String.valueOf(CosmosDBConfig.DefaultMaxMiniBatchImportSizeKB))
-      .toInt
 
     val maxConcurrencyPerPartitionRange = config
       .getOrElse[String](CosmosDBConfig.BulkImportMaxConcurrencyPerPartitionRange, String.valueOf(CosmosDBConfig.DefaultBulkImportMaxConcurrencyPerPartitionRange))
